@@ -84,7 +84,8 @@ chmod 600 ~/.pi/agent/pi-qqbot.json
 
 字段说明：
 
-- `enabled`: 是否启动 QQ 网关连接。默认 `false`。
+- `enabled`: 是否启用扩展。默认 `false`。
+- `autoStart`: 是否随 Pi 启动自动连接 QQ 网关。默认 `false`——不自动连，需用 `/qqbot-start` 手动打开（避免网络不通时开机狂刷重连报错）。
 - `appId`, `clientSecret`: QQ 开放平台机器人凭据。不要提交到 Git。
 - `sandbox`: `true` 使用 QQ 沙箱环境；正式环境设为 `false`。
 - `allowUsers`: 允许使用机器人的 C2C 用户 openid 列表。
@@ -94,6 +95,13 @@ chmod 600 ~/.pi/agent/pi-qqbot.json
 - `debug`: 是否开启本地调试通知和 `/qqbot-fake`。
 
 安全默认值：如果 `allowUsers` 和 `allowGroups` 都为空，扩展不会处理任何真实 QQ 入站消息。
+
+### 本地 Pi 命令（在 Pi 终端里用）
+
+- `/qqbot-start`: 连接 QQ 网关（`autoStart:false` 时用它手动打开）。
+- `/qqbot-stop`: 断开 QQ 网关。
+- `/qqbot-status`: 查看连接状态。
+- `/qqbot-reconnect`: 强制重连（连不上重试 5 次后会自动停止，用这个重试）。
 
 ### QQ 侧命令
 
@@ -244,7 +252,8 @@ Edit `~/.pi/agent/pi-qqbot.json`:
 
 Fields:
 
-- `enabled`: Starts the QQ gateway connection when true. Default: false.
+- `enabled`: Enables the extension. Default: false.
+- `autoStart`: Connect the QQ gateway on Pi startup. Default: false — the gateway is opened on demand with `/qqbot-start` (prevents reconnect spam at startup when QQ is unreachable).
 - `appId`, `clientSecret`: QQ Open Platform bot credentials. Never commit them.
 - `sandbox`: Use QQ sandbox endpoints when true.
 - `allowUsers`: Allowed C2C user openids.
@@ -255,6 +264,14 @@ Fields:
 
 Safe default: if both allowlists are empty, no real inbound QQ message is
 processed.
+
+### Local Pi Commands (in the Pi terminal)
+
+- `/qqbot-start`: Connect the QQ gateway (use this when `autoStart:false`).
+- `/qqbot-stop`: Disconnect the QQ gateway.
+- `/qqbot-status`: Show connection state.
+- `/qqbot-reconnect`: Force a reconnect (auto-reconnect stops after 5 failed
+  attempts; use this to retry).
 
 ### QQ-side Commands
 

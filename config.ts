@@ -17,6 +17,7 @@ export const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-qqbot.json");
 
 const DEFAULTS: PiQQBotConfig = {
 	enabled: false,
+	autoStart: false,
 	appId: "",
 	clientSecret: "",
 	sandbox: true,

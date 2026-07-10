@@ -14,15 +14,60 @@
  * inbound message is processed.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { loadConfig, validateEnabled } from "./config";
 import { PiQQBotRuntime } from "./router";
+import type { PiQQBotConfig } from "./types";
 
 let runtime: PiQQBotRuntime | undefined;
+let currentConfig: PiQQBotConfig | undefined;
 let debugCommandRegistered = false;
 
 export default function (pi: ExtensionAPI) {
+	// Create + connect the runtime on demand (shared by /qqbot-start and autoStart).
+	const connect = async (ctx: ExtensionContext): Promise<void> => {
+		if (runtime) return;
+		if (!currentConfig) return;
+		const rt = new PiQQBotRuntime(pi, currentConfig);
+		runtime = rt;
+		await rt.start(ctx);
+	};
+
+	pi.registerCommand("qqbot-start", {
+		description: "Connect the Pi QQBot gateway",
+		handler: async (_args, ctx) => {
+			if (!currentConfig || !currentConfig.enabled) {
+				ctx.ui.notify("pi-qqbot: not enabled (set \"enabled\": true in ~/.pi/agent/pi-qqbot.json)", "warning");
+				return;
+			}
+			const invalid = validateEnabled(currentConfig);
+			if (invalid) {
+				ctx.ui.notify(`pi-qqbot: cannot start (${invalid})`, "warning");
+				return;
+			}
+			if (runtime) {
+				ctx.ui.notify(`pi-qqbot already running\n${runtime.statusText()}`, "info");
+				return;
+			}
+			await connect(ctx);
+			ctx.ui.notify(runtime?.statusText() ?? "pi-qqbot started", "info");
+		},
+	});
+
+	pi.registerCommand("qqbot-stop", {
+		description: "Disconnect the Pi QQBot gateway",
+		handler: async (_args, ctx) => {
+			if (!runtime) {
+				ctx.ui.notify("pi-qqbot is not running", "info");
+				return;
+			}
+			await runtime.stop();
+			runtime = undefined;
+			ctx.ui.notify("pi-qqbot stopped", "info");
+		},
+	});
+
 	pi.registerCommand("qqbot-status", {
 		description: "Show Pi QQBot connection status",
 		handler: async (_args, ctx) => {
@@ -69,6 +114,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		currentConfig = config;
+
 		// Debug-only local test command, gated behind config.debug.
 		if (config.debug && !debugCommandRegistered) {
 			debugCommandRegistered = true;
@@ -80,7 +127,7 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					if (!runtime) {
-						cctx.ui.notify("pi-qqbot is not running", "warning");
+						cctx.ui.notify("pi-qqbot is not running (use /qqbot-start)", "warning");
 						return;
 					}
 					runtime.simulateInbound(args.trim());
@@ -88,8 +135,15 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		runtime = new PiQQBotRuntime(pi, config);
-		await runtime.start(ctx);
+		// Do NOT connect automatically unless autoStart is set. Otherwise the user
+		// opens the gateway on demand with /qqbot-start (avoids startup reconnect
+		// spam when the network cannot reach QQ).
+		if (config.autoStart) {
+			runtime = new PiQQBotRuntime(pi, config);
+			await runtime.start(ctx);
+		} else if (ctx.hasUI) {
+			ctx.ui.notify("pi-qqbot: ready (not connected). Use /qqbot-start to connect.", "info");
+		}
 	});
 
 	pi.on("session_shutdown", async () => {

@@ -34,6 +34,7 @@ const OP_HELLO = 10;
 const OP_HEARTBEAT_ACK = 11;
 
 const MAX_BACKOFF_MS = 30_000;
+const MAX_RECONNECT_ATTEMPTS = 5; // then give up until a manual /qqbot-reconnect
 
 export interface QQGatewayCallbacks {
 	onInbound: (msg: QQInboundMessage) => void;
@@ -59,6 +60,7 @@ export class QQGateway {
 	private lastSeq: number | null = null;
 	private sessionId?: string;
 	private backoffMs = 1000;
+	private reconnectAttempts = 0;
 	private closing = false;
 
 	constructor(auth: QQAuth, opts: { sandbox: boolean }, cb: QQGatewayCallbacks) {
@@ -93,6 +95,8 @@ export class QQGateway {
 		this.sessionId = undefined;
 		this.lastSeq = null;
 		this.closing = false;
+		this.backoffMs = 1000;
+		this.reconnectAttempts = 0;
 		this.clearTimers();
 		if (this.ws) {
 			try {
@@ -170,9 +174,19 @@ export class QQGateway {
 	private scheduleReconnect(): void {
 		if (this.closing) return;
 		if (this.reconnectTimer) return;
+		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+			this.closing = true; // stop the loop; require a manual reconnect
+			this.cb.onState(
+				"error",
+				`gave up after ${MAX_RECONNECT_ATTEMPTS} attempts; use /qqbot-reconnect to retry`,
+			);
+			this.cb.log("gave up reconnecting; use /qqbot-reconnect");
+			return;
+		}
+		this.reconnectAttempts++;
 		const delay = this.backoffMs;
 		this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
-		this.cb.log(`reconnecting in ${delay}ms`);
+		this.cb.log(`reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = undefined;
 			void this.openSocket();
@@ -294,12 +308,14 @@ export class QQGateway {
 			const d = payload.d as { session_id?: string } | undefined;
 			this.sessionId = d?.session_id;
 			this.backoffMs = 1000; // reset backoff on success
+			this.reconnectAttempts = 0;
 			this.cb.onState("connected");
 			this.cb.log("gateway READY");
 			return;
 		}
 		if (t === "RESUMED") {
 			this.backoffMs = 1000;
+			this.reconnectAttempts = 0;
 			this.cb.onState("connected");
 			this.cb.log("gateway RESUMED");
 			return;

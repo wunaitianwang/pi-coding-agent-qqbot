@@ -4,6 +4,8 @@
 
 export interface PiQQBotConfig {
 	enabled: boolean;
+	/** Connect the QQ gateway automatically on Pi startup. Default false: use /qqbot-start. */
+	autoStart?: boolean;
 	appId: string;
 	clientSecret: string;
 	sandbox?: boolean;

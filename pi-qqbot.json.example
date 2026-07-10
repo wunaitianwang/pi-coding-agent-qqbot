@@ -1,5 +1,6 @@
 {
   "enabled": false,
+  "autoStart": false,
   "appId": "YOUR_QQBOT_APP_ID",
   "clientSecret": "YOUR_QQBOT_APP_SECRET",
   "sandbox": true,
