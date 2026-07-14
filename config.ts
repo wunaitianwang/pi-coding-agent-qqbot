@@ -1,8 +1,8 @@
 /** Config loading and strict normalization for pi-qqbot. */
 
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { PiQQBotConfig, QQMediaConfig, QQMediaSttConfig } from "./types";
 
@@ -27,8 +27,9 @@ const MEDIA_DEFAULTS: QQMediaConfig = {
 };
 
 const DEFAULTS: PiQQBotConfig = {
+	schemaVersion: 2,
 	enabled: false,
-	autoStart: false,
+	autoStart: true,
 	appId: "",
 	clientSecret: "",
 	sandbox: true,
@@ -37,7 +38,30 @@ const DEFAULTS: PiQQBotConfig = {
 	replyPrefix: "",
 	maxQueueSize: 20,
 	sendBusyNotice: false,
-	allowCommands: false,
+	allowCommands: true,
+	commands: {
+		enabled: true,
+		accessRequests: true,
+		allowInGroups: false,
+		admins: [],
+		buttons: true,
+		maxListItems: 5,
+		modelPageSize: 6,
+		selectionTtlMs: 300_000,
+		confirmationTtlMs: 120_000,
+	},
+	sessions: {
+		mode: "persistent",
+		scope: "conversation",
+		restore: "recent",
+		maxResident: 8,
+		idleDisposeMs: 1_800_000,
+	},
+	startup: {
+		mode: "auto",
+		keepAcrossLocalSessions: true,
+		handoffGraceMs: 10_000,
+	},
 	showProcess: false,
 	replyFormat: "auto",
 	media: MEDIA_DEFAULTS,
@@ -71,6 +95,65 @@ export async function loadConfig(): Promise<LoadConfigResult> {
 	return { config: normalizeConfig(parsed) };
 }
 
+export async function updateAccessList(
+	userOpenId: string,
+	role: "user" | "admin",
+): Promise<PiQQBotConfig> {
+	const normalizedOpenId = userOpenId.trim();
+	if (!normalizedOpenId || normalizedOpenId.length > 256 || /[\u0000-\u001f\u007f]/.test(normalizedOpenId)) {
+		throw new Error("invalid QQ user openid");
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await readFile(CONFIG_PATH, "utf-8"));
+	} catch (err) {
+		throw new Error(`cannot read pi-qqbot config: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	if (!isRecord(parsed)) throw new Error("pi-qqbot config root must be a JSON object");
+	const next = structuredClone(parsed);
+	next.allowUsers = appendUniqueString(next.allowUsers, normalizedOpenId);
+	const commands = isRecord(next.commands) ? { ...next.commands } : {};
+	if (role === "admin") commands.admins = appendUniqueString(commands.admins, normalizedOpenId);
+	next.commands = commands;
+	const dir = dirname(CONFIG_PATH);
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	const tempPath = `${CONFIG_PATH}.tmp-${process.pid}-${Date.now()}`;
+	try {
+		await writeFile(tempPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+		await rename(tempPath, CONFIG_PATH);
+		await chmod(CONFIG_PATH, 0o600);
+	} catch (err) {
+		await import("node:fs/promises").then((fs) => fs.rm(tempPath, { force: true })).catch(() => undefined);
+		throw err;
+	}
+	return normalizeConfig(next);
+}
+
+export async function removeAccessUser(userOpenId: string): Promise<PiQQBotConfig> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await readFile(CONFIG_PATH, "utf-8"));
+	} catch (err) {
+		throw new Error(`cannot read pi-qqbot config: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	if (!isRecord(parsed)) throw new Error("pi-qqbot config root must be a JSON object");
+	const next = structuredClone(parsed);
+	next.allowUsers = stringArray(next.allowUsers).filter((value) => value !== userOpenId);
+	const commands = isRecord(next.commands) ? { ...next.commands } : {};
+	commands.admins = stringArray(commands.admins).filter((value) => value !== userOpenId);
+	next.commands = commands;
+	const tempPath = `${CONFIG_PATH}.tmp-${process.pid}-${Date.now()}`;
+	try {
+		await writeFile(tempPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+		await rename(tempPath, CONFIG_PATH);
+		await chmod(CONFIG_PATH, 0o600);
+	} catch (err) {
+		await import("node:fs/promises").then((fs) => fs.rm(tempPath, { force: true })).catch(() => undefined);
+		throw err;
+	}
+	return normalizeConfig(next);
+}
+
 export function normalizeConfig(parsed: unknown): PiQQBotConfig {
 	const raw = isRecord(parsed) ? parsed : {};
 	const rawMedia = isRecord(raw.media) ? raw.media : {};
@@ -78,12 +161,21 @@ export function normalizeConfig(parsed: unknown): PiQQBotConfig {
 	const rawVoice = isRecord(rawMedia.voice) ? rawMedia.voice : {};
 	const rawDocuments = isRecord(rawMedia.documents) ? rawMedia.documents : {};
 	const rawStt = isRecord(rawVoice.stt) ? rawVoice.stt : undefined;
+	const rawCommands = isRecord(raw.commands) ? raw.commands : {};
+	const rawSessions = isRecord(raw.sessions) ? raw.sessions : {};
+	const rawStartup = isRecord(raw.startup) ? raw.startup : {};
+	const legacyAutoStart = bool(raw.autoStart, true);
+	// v0.3 exposed allowCommands but could not execute built-in Pi commands.
+	// New installs enable the explicit SDK command controller; an explicitly
+	// configured legacy false remains respected during migration.
+	const legacyAllowCommands = bool(raw.allowCommands, true);
 
 	const config: PiQQBotConfig = {
 		...DEFAULTS,
 		...raw,
+		schemaVersion: 2,
 		enabled: bool(raw.enabled, DEFAULTS.enabled),
-		autoStart: bool(raw.autoStart, DEFAULTS.autoStart ?? false),
+		autoStart: legacyAutoStart,
 		appId: stringValue(raw.appId, ""),
 		clientSecret: stringValue(raw.clientSecret, ""),
 		sandbox: bool(raw.sandbox, true),
@@ -92,7 +184,37 @@ export function normalizeConfig(parsed: unknown): PiQQBotConfig {
 		replyPrefix: stringValue(raw.replyPrefix, ""),
 		maxQueueSize: integer(raw.maxQueueSize, 20, 1, 1000),
 		sendBusyNotice: bool(raw.sendBusyNotice, false),
-		allowCommands: bool(raw.allowCommands, false),
+		allowCommands: legacyAllowCommands,
+		commands: {
+			enabled: bool(rawCommands.enabled, legacyAllowCommands),
+			accessRequests: bool(rawCommands.accessRequests, true),
+			allowInGroups: bool(rawCommands.allowInGroups, false),
+			admins: stringArray(rawCommands.admins),
+			buttons: bool(rawCommands.buttons, true),
+			maxListItems: integer(rawCommands.maxListItems, 5, 1, 10),
+			// QQ keyboards permit at most five rows. Six models use three rows,
+			// leaving room for page navigation and the help action.
+			modelPageSize: integer(rawCommands.modelPageSize, 6, 1, 6),
+			selectionTtlMs: integer(rawCommands.selectionTtlMs, 300_000, 30_000, 900_000),
+			confirmationTtlMs: integer(rawCommands.confirmationTtlMs, 120_000, 30_000, 300_000),
+		},
+		sessions: {
+			mode: rawSessions.mode === "memory" ? "memory" : "persistent",
+			scope: "conversation",
+			restore: rawSessions.restore === "new" ? "new" : "recent",
+			maxResident: integer(rawSessions.maxResident, 8, 1, 32),
+			idleDisposeMs: integer(rawSessions.idleDisposeMs, 1_800_000, 60_000, 86_400_000),
+		},
+		startup: {
+			mode:
+				rawStartup.mode === "manual" || rawStartup.mode === "service"
+					? rawStartup.mode
+					: legacyAutoStart
+						? "auto"
+						: "manual",
+			keepAcrossLocalSessions: bool(rawStartup.keepAcrossLocalSessions, true),
+			handoffGraceMs: integer(rawStartup.handoffGraceMs, 10_000, 1000, 60_000),
+		},
 		showProcess: bool(raw.showProcess, false),
 		replyFormat: raw.replyFormat === "plain" ? "plain" : "auto",
 		debug: bool(raw.debug, false),
@@ -162,6 +284,10 @@ function stringValue(value: unknown, fallback: string): string {
 
 function stringArray(value: unknown): string[] {
 	return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+function appendUniqueString(value: unknown, item: string): string[] {
+	return [...new Set([...stringArray(value), item])];
 }
 
 function integer(value: unknown, fallback: number, min: number, max: number): number {

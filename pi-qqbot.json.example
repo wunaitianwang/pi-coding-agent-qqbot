@@ -1,6 +1,11 @@
 {
+  "schemaVersion": 2,
   "enabled": false,
-  "autoStart": false,
+  "startup": {
+    "mode": "auto",
+    "keepAcrossLocalSessions": true,
+    "handoffGraceMs": 10000
+  },
   "appId": "YOUR_QQBOT_APP_ID",
   "clientSecret": "YOUR_QQBOT_APP_SECRET",
   "sandbox": true,
@@ -9,7 +14,24 @@
   "replyPrefix": "",
   "maxQueueSize": 20,
   "sendBusyNotice": false,
-  "allowCommands": false,
+  "commands": {
+    "enabled": true,
+    "accessRequests": true,
+    "allowInGroups": false,
+    "admins": [],
+    "buttons": true,
+    "maxListItems": 5,
+    "modelPageSize": 6,
+    "selectionTtlMs": 300000,
+    "confirmationTtlMs": 120000
+  },
+  "sessions": {
+    "mode": "persistent",
+    "scope": "conversation",
+    "restore": "recent",
+    "maxResident": 8,
+    "idleDisposeMs": 1800000
+  },
   "showProcess": false,
   "replyFormat": "auto",
   "media": {

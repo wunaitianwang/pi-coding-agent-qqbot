@@ -43,9 +43,38 @@ export interface QQMediaConfig {
 
 export type QQReplyFormat = "auto" | "plain";
 
-export interface PiQQBotConfig {
+export interface QQCommandConfig {
 	enabled: boolean;
-	/** Connect the QQ gateway automatically on Pi startup. Default false: use /qqbot-start. */
+	accessRequests: boolean;
+	allowInGroups: boolean;
+	/** QQ user/member openids allowed to mutate model and session state. */
+	admins: string[];
+	buttons: boolean;
+	maxListItems: number;
+	modelPageSize: number;
+	selectionTtlMs: number;
+	confirmationTtlMs: number;
+}
+
+export interface QQSessionConfig {
+	mode: "persistent" | "memory";
+	scope: "conversation";
+	restore: "recent" | "new";
+	maxResident: number;
+	idleDisposeMs: number;
+}
+
+export interface QQStartupConfig {
+	mode: "auto" | "manual" | "service";
+	keepAcrossLocalSessions: boolean;
+	handoffGraceMs: number;
+}
+
+export interface PiQQBotConfig {
+	/** Persisted config schema. Legacy files without it are normalized as v2. */
+	schemaVersion: 2;
+	enabled: boolean;
+	/** @deprecated Use startup.mode. Kept for one-version config compatibility. */
 	autoStart?: boolean;
 	appId: string;
 	clientSecret: string;
@@ -55,8 +84,11 @@ export interface PiQQBotConfig {
 	replyPrefix?: string;
 	maxQueueSize?: number;
 	sendBusyNotice?: boolean;
-	/** Allow forwarding non-qqbot pi slash commands from QQ (fire-and-forget). */
+	/** @deprecated Use commands.enabled. Unknown slash input is never forwarded as a prompt. */
 	allowCommands?: boolean;
+	commands: QQCommandConfig;
+	sessions: QQSessionConfig;
+	startup: QQStartupConfig;
 	/** Include a compact execution summary after the final answer. */
 	showProcess?: boolean;
 	/** Prefer native QQ Markdown with a safe plain-text fallback, or force plain text. */
@@ -144,6 +176,29 @@ export interface QQReplyTarget {
 	groupOpenId?: string;
 	msgId: string; // original inbound message id
 	createdAt: number; // to reason about the passive-reply window
+}
+
+export interface QQKeyboardButton {
+	id: string;
+	render_data: {
+		label: string;
+		visited_label: string;
+		style: 0 | 1;
+	};
+	action: {
+		type: 2;
+		permission: { type: 2 };
+		data: string;
+		reply: boolean;
+		enter: boolean;
+		unsupport_tips: string;
+	};
+}
+
+export interface QQKeyboard {
+	content: {
+		rows: Array<{ buttons: QQKeyboardButton[] }>;
+	};
 }
 
 export type ConnectionState =

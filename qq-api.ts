@@ -5,7 +5,7 @@
  */
 
 import type { QQAuth } from "./qq-auth";
-import type { QQReplyTarget } from "./types";
+import type { QQKeyboard, QQReplyTarget } from "./types";
 
 const PROD_BASE = "https://api.sgroup.qq.com";
 const SANDBOX_BASE = "https://sandbox.api.sgroup.qq.com";
@@ -39,12 +39,18 @@ export class QQApi {
 		await this.send(target, { content, msg_type: 0, msg_id: target.msgId, msg_seq: msgSeq });
 	}
 
-	async sendMarkdown(target: QQReplyTarget, content: string, msgSeq: number): Promise<void> {
+	async sendMarkdown(
+		target: QQReplyTarget,
+		content: string,
+		msgSeq: number,
+		keyboard?: QQKeyboard,
+	): Promise<void> {
 		await this.send(target, {
 			markdown: { content },
 			msg_type: 2,
 			msg_id: target.msgId,
 			msg_seq: msgSeq,
+			...(keyboard ? { keyboard } : {}),
 			// QQ documents group content as required even for Markdown.
 			...(target.type === "group" ? { content: " " } : {}),
 		});

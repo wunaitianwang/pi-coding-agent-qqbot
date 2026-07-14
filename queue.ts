@@ -37,4 +37,18 @@ export class MessageQueue {
 	clear(): void {
 		this.pending.length = 0;
 	}
+
+	hasWhere(predicate: (msg: QQInboundMessage) => boolean): boolean {
+		return this.pending.some(predicate);
+	}
+
+	removeWhere(predicate: (msg: QQInboundMessage) => boolean): number {
+		let removed = 0;
+		for (let index = this.pending.length - 1; index >= 0; index--) {
+			if (!predicate(this.pending[index])) continue;
+			this.pending.splice(index, 1);
+			removed++;
+		}
+		return removed;
+	}
 }

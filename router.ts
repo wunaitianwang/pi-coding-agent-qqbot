@@ -14,13 +14,21 @@
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
+import { authorizeQQCommand, QQ_COMMAND_NAMES, QQ_REMOTE_BLOCKED_COMMANDS } from "./command-controller";
+import { parseQQCommand, type ParsedQQCommand } from "./command-parser";
+import { ConversationRegistry, conversationKey } from "./conversation-registry";
+
+import { QQAccessRequestStore, type QQAccessRequest } from "./access-requests";
 import { AttachmentPipeline, classifyAttachment } from "./attachment-pipeline";
 import { maskAppId } from "./config";
+import { buildModelPage, formatModelPageFallback, type ModelPage } from "./model-pages";
 import { QQApi, QQApiError } from "./qq-api";
 import { QQAuth } from "./qq-auth";
 import { QQGateway } from "./qq-gateway";
-import { QQAgentSession, type QQAgentRunEvent, type QQToolCall } from "./qq-session";
+import { type QQAgentRunEvent, type QQAgentSession, type QQModelInfo, type QQSessionInfo, type QQToolCall, resolveSdkEntry } from "./qq-session";
+import { buildCommandKeyboard, type QQCommandButton } from "./qq-keyboard";
 import { MessageQueue } from "./queue";
 import { formatQQReply, QQ_MAX_REPLY_CHUNKS } from "./reply-formatter";
 import type {
@@ -28,6 +36,7 @@ import type {
 	PiQQBotConfig,
 	QQConversationObserver,
 	QQInboundMessage,
+	QQKeyboard,
 	PreparedAttachment,
 	QQReplyTarget,
 	QQTerminalEvent,
@@ -35,27 +44,6 @@ import type {
 
 const SUMMARY_MAX = 120;
 const MAX_TRANSCRIPT_LINES = 6;
-
-// pi slash commands that must NOT be run from QQ: they are local-session
-// lifecycle/interactive commands with no meaning in the isolated QQ session.
-const BLOCKED_COMMANDS = new Set([
-	"new",
-	"resume",
-	"fork",
-	"clone",
-	"reload",
-	"quit",
-	"exit",
-	"clear",
-	"compact",
-	"tree",
-	"model",
-	"login",
-	"logout",
-	"theme",
-	"redo",
-	"undo",
-]);
 
 interface InboundSummary {
 	type: "private" | "group";
@@ -77,7 +65,7 @@ interface OutboundSummary {
 }
 
 export class PiQQBotRuntime {
-	private readonly config: PiQQBotConfig;
+	private config: PiQQBotConfig;
 
 	private auth?: QQAuth;
 	private gateway?: QQGateway;
@@ -85,7 +73,8 @@ export class PiQQBotRuntime {
 	private readonly queue: MessageQueue;
 	private readonly attachmentPipeline: AttachmentPipeline;
 	private readonly seenMessages = new MessageDedupe(2 * 60 * 60 * 1000, 2000);
-	private qq?: QQAgentSession;
+	private readonly accessRequests = new QQAccessRequestStore();
+	private conversations?: ConversationRegistry;
 	private runtimeAbort = new AbortController();
 
 	private ctx?: ExtensionContext;
@@ -112,6 +101,27 @@ export class PiQQBotRuntime {
 		this.attachmentPipeline = new AttachmentPipeline(config, randomUUID());
 	}
 
+	applyRuntimeConfig(config: PiQQBotConfig): void {
+		// Gateway credentials, storage, and media boundaries are cold settings and
+		// cause Host replacement. These command/display settings are safe to apply
+		// to an already connected runtime.
+		this.config = {
+			...this.config,
+			allowUsers: [...(config.allowUsers ?? [])],
+			allowGroups: [...(config.allowGroups ?? [])],
+			replyPrefix: config.replyPrefix,
+			sendBusyNotice: config.sendBusyNotice,
+			showProcess: config.showProcess,
+			replyFormat: config.replyFormat,
+			debug: config.debug,
+			commands: { ...config.commands, admins: [...config.commands.admins] },
+		};
+	}
+
+	applyAccessConfig(config: PiQQBotConfig): void {
+		this.applyRuntimeConfig(config);
+	}
+
 	attachObserver(observer: QQConversationObserver): void {
 		this.observer = observer;
 		this.emitRuntimeState();
@@ -122,32 +132,31 @@ export class PiQQBotRuntime {
 	}
 
 	isReady(): boolean {
-		return this.qq?.isReady() === true;
+		return this.conversations !== undefined && this.state !== "disconnected";
+	}
+
+	isIdle(): boolean {
+		return !this.running && this.queue.size === 0;
+	}
+
+	async waitForIdle(timeoutMs: number): Promise<boolean> {
+		const deadline = Date.now() + Math.max(0, timeoutMs);
+		while (!this.isIdle() && Date.now() < deadline) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 100));
+		}
+		return this.isIdle();
 	}
 
 	async start(ctx: ExtensionContext): Promise<boolean> {
 		this.ctx = ctx;
 		this.runtimeAbort = new AbortController();
+		this.state = "connecting";
+		this.emitRuntimeState();
 
-		// Isolated QQ session first, so QQ traffic never touches the local session.
-		const qq = new QQAgentSession();
-		this.qq = qq;
-		try {
-			await qq.init(ctx.cwd);
-		} catch (err) {
-			if (this.qq === qq) this.qq = undefined;
-			this.state = "error";
-			this.stateDetail = "isolated session initialization failed";
-			this.lastError = `qq session init failed: ${err instanceof Error ? err.message : String(err)}`;
-			this.emit({ kind: "error", stage: "session init", message: this.lastError, at: Date.now() });
-			this.emitRuntimeState();
-			this.notify(`pi-qqbot: ${this.lastError}`, "error");
-			return false; // without an isolated session we must not fall back to the local session
-		}
-		if (this.qq !== qq || !qq.isReady()) {
-			if (this.qq === qq) this.qq = undefined;
-			return false; // stopped while asynchronous initialization was in flight
-		}
+		// Conversation runtimes are created lazily after allowlist admission. This
+		// keeps startup fast while preserving strict isolation from the local TUI.
+		const sdk = await import(pathToFileURL(resolveSdkEntry()).href);
+		this.conversations = new ConversationRegistry(this.config, sdk.getAgentDir(), ctx.cwd);
 
 		this.auth = new QQAuth(this.config.appId, this.config.clientSecret);
 		this.api = new QQApi(this.auth, { sandbox: this.config.sandbox ?? true });
@@ -173,14 +182,14 @@ export class PiQQBotRuntime {
 
 	async stop(): Promise<void> {
 		this.runtimeAbort.abort(new Error("QQBot stopped"));
-		await this.qq?.abort();
 		if (this.pumpTimer) clearTimeout(this.pumpTimer);
 		this.pumpTimer = undefined;
 		this.pumpScheduled = false;
 		this.gateway?.close();
 		this.gateway = undefined;
-		this.qq?.dispose();
-		this.qq = undefined;
+		const conversations = this.conversations;
+		this.conversations = undefined;
+		await conversations?.dispose();
 		this.queue.clear();
 		this.activeTarget = undefined;
 		this.activeFake = false;
@@ -197,12 +206,51 @@ export class PiQQBotRuntime {
 		await this.gateway.reconnect();
 	}
 
+	listAccessRequests(): QQAccessRequest[] {
+		return this.accessRequests.list();
+	}
+
+	approveAccessRequest(code: string): QQAccessRequest | undefined {
+		return this.accessRequests.approve(code);
+	}
+
+	denyAccessRequest(code: string): QQAccessRequest | undefined {
+		return this.accessRequests.deny(code);
+	}
+
+	async notifyAccessDecision(request: QQAccessRequest, decision: "user" | "admin" | "denied"): Promise<void> {
+		const text = decision === "denied"
+			? "## 访问申请未通过\n\n主机管理员没有批准本次申请。"
+			: `## 访问申请已批准\n\n权限：**${decision === "admin" ? "管理员" : "普通用户"}**\n\n现在可以重新发送消息。`;
+		await this.replyToQQ(request.message, text);
+	}
+
+	private emitAccessRequest(request: QQAccessRequest): void {
+		this.notify(
+			`QQBot 收到新的访问申请\n申请码：${request.code}\n用户：${maskOpenId(request.userOpenId)}\n使用 /qqbot-requests 处理`,
+			"warning",
+		);
+	}
+
+	private async replyToUnauthorizedApplicant(request: QQAccessRequest): Promise<void> {
+		await this.replyToQQ(
+			request.message,
+			`## 已提交访问申请\n\n申请码：\`${request.code}\`\n\n请等待主机管理员确认。申请 10 分钟内有效；批准后请重新发送消息。`,
+		).catch((err) => this.debugLog(`access request reply failed: ${err instanceof Error ? err.message : String(err)}`));
+	}
+
 	// --- Agent run (isolated QQ session) ------------------------------------
 
 	private async runOne(msg: QQInboundMessage): Promise<void> {
-		if (!this.qq?.isReady()) {
-			this.lastError = "qq session not ready";
-			this.emit({ kind: "error", messageId: msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
+		let qq: QQAgentSession;
+		try {
+			if (!this.conversations) throw new Error("conversation registry not ready");
+			qq = await this.conversations.get(msg);
+		} catch (err) {
+			this.lastError = `qq session init failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.emit({ kind: "error", messageId: msg.id, stage: "session init", message: this.lastError, at: Date.now() });
+			await this.replyToQQ(msg, `## QQ 会话不可用\n\n${this.lastError}\n\n请稍后重试，或在主机查看 /qqbot-status。`).catch(() => undefined);
+			this.schedulePump();
 			return;
 		}
 		this.running = true;
@@ -249,7 +297,7 @@ export class PiQQBotRuntime {
 			this.activeAttachmentStatus = undefined;
 
 			const readyImages = prepared.resources.filter((resource) => resource.kind === "image" && resource.status === "ready");
-			if (readyImages.length && !this.qq.supportsImages()) {
+			if (readyImages.length && !qq.supportsImages()) {
 				const reply = msg.text.trim()
 					? "当前 QQ Agent 使用的模型不支持图片理解。我没有读取图片；请切换到支持视觉输入的模型后重试。你的文字内容也未提交，以避免产生误导性回答。"
 					: "当前 QQ Agent 使用的模型不支持图片理解，因此没有运行可能产生误导的模型回合。请切换到支持视觉输入的模型后重试。";
@@ -262,7 +310,7 @@ export class PiQQBotRuntime {
 				return;
 			}
 
-			const { text, tools } = await this.qq.run(withQQReplyGuidance(prepared.prompt), prepared.images, (event) =>
+			const { text, tools } = await qq.run(withQQReplyGuidance(prepared.prompt), prepared.images, (event) =>
 				this.forwardAgentEvent(msg.id, event),
 			);
 			const body = this.config.showProcess
@@ -334,8 +382,10 @@ export class PiQQBotRuntime {
 			type: msg.type,
 			user: msg.userOpenId,
 			group: msg.groupOpenId,
-			text: msg.text,
-			attachments: attachmentSummary,
+			// Before approval retain identity/event metadata only. Unauthorized
+			// message text and attachment names must not remain in diagnostics.
+			text: allowed ? msg.text : "",
+			attachments: allowed ? attachmentSummary : [],
 			at: msg.receivedAt,
 			authorized: allowed,
 		};
@@ -348,6 +398,13 @@ export class PiQQBotRuntime {
 			this.debugLog(
 				`ignored unauthorized ${msg.type} openid=${msg.type === "group" ? msg.groupOpenId : msg.userOpenId}`,
 			);
+			if (this.config.commands.accessRequests && msg.type === "private") {
+				const admission = this.accessRequests.admit(msg);
+				if (admission.request && admission.created) {
+					this.emitAccessRequest(admission.request);
+					void this.replyToUnauthorizedApplicant(admission.request);
+				}
+			}
 			return;
 		}
 
@@ -368,7 +425,11 @@ export class PiQQBotRuntime {
 			fake: msg.fake === true,
 			at: msg.receivedAt,
 		});
-		if (text.startsWith("/") && msg.attachments.length === 0) {
+		if (text.startsWith("/")) {
+			if (msg.attachments.length > 0) {
+				void this.replyToQQ(msg, "## 命令未执行\n\n管理命令不能与附件同时发送。请单独发送命令，附件没有被下载。");
+				return;
+			}
 			this.handleCommand(msg, text);
 			return;
 		}
@@ -392,43 +453,362 @@ export class PiQQBotRuntime {
 		this.schedulePump();
 	}
 
-	// --- Commands (treat the QQ chat like the pi input box) -----------------
+	// --- QQ command control plane -----------------------------------------
 
-	/**
-	 * Handle a QQ message that starts with "/".
-	 *  - /qqbot-status | /qqbot-last | /qqbot-help | /help -> answered to QQ.
-	 *  - blocked local-session lifecycle commands -> refused.
-	 *  - anything else -> run in the isolated QQ session as input (when
-	 *    allowCommands), otherwise refused with a hint.
-	 */
 	private handleCommand(msg: QQInboundMessage, text: string): void {
-		const name = text.slice(1).split(/\s+/)[0].toLowerCase();
-
-		if (name === "qqbot-status") {
-			void this.replyToQQ(msg, this.statusText());
+		let command: ParsedQQCommand | undefined;
+		try {
+			command = parseQQCommand(text);
+		} catch (err) {
+			void this.replyToQQ(msg, `## 命令未执行\n\n${err instanceof Error ? err.message : String(err)}\n\n发送 \`/help\` 查看用法。`);
 			return;
 		}
-		if (name === "qqbot-last") {
-			void this.replyToQQ(msg, this.lastSummary());
+		if (!command) return;
+		const authorization = authorizeQQCommand(this.config, msg, command);
+		if (!authorization.allowed) {
+			const known = QQ_COMMAND_NAMES.has(command.name);
+			const blocked = QQ_REMOTE_BLOCKED_COMMANDS.has(command.name);
+			const title = known && !blocked ? "命令未开启或无权限" : "命令未执行";
+			void this.replyToQQ(msg, `## ${title}\n\n${authorization.reason}\n\n发送 \`/help\` 查看可用命令。`);
 			return;
 		}
-		if (name === "qqbot-help" || name === "help") {
-			void this.replyToQQ(msg, this.helpText());
-			return;
-		}
-		if (BLOCKED_COMMANDS.has(name)) {
-			void this.replyToQQ(msg, `\u547d\u4ee4 /${name} \u4e0d\u652f\u6301\u4ece QQ \u6267\u884c\uff08\u672c\u5730\u4f1a\u8bdd\u751f\u547d\u5468\u671f/\u4ea4\u4e92\u547d\u4ee4\uff09\u3002`);
-			return;
-		}
-		if (!this.config.allowCommands) {
-			void this.replyToQQ(msg, "\u547d\u4ee4\u672a\u5f00\u542f\u3002\u53d1 /qqbot-help \u770b\u53ef\u7528\u547d\u4ee4\u3002");
-			return;
-		}
-		// Treat as input to the isolated QQ session (kept verbatim, including the "/").
-		this.enqueuePrompt(msg);
+		void this.executeCommand(msg, command).catch((err) => {
+			const detail = err instanceof Error ? err.message : String(err);
+			this.lastError = `command /${command?.name ?? "unknown"} failed: ${detail}`;
+			this.emit({ kind: "error", messageId: msg.id, stage: "command", message: this.lastError, at: Date.now() });
+			return this.replyToQQ(
+				msg,
+				`## 命令未执行\n\n${sanitizeCommandError(detail)}\n\n当前 QQ 会话仍保持原状态。发送 \`/help ${command?.name ?? ""}\` 查看用法。`,
+			);
+		});
 	}
 
-	private async replyToQQ(msg: QQInboundMessage, text: string): Promise<void> {
+	private async executeCommand(msg: QQInboundMessage, command: ParsedQQCommand): Promise<void> {
+		switch (command.name) {
+			case "help":
+				await this.replyToQQ(msg, this.commandHelp(command.args[0]), this.helpKeyboard(msg));
+				return;
+			case "status":
+				await this.replyToQQ(msg, await this.qqStatusText(msg), this.helpKeyboard(msg));
+				return;
+			case "last":
+				await this.replyToQQ(msg, this.lastSummary());
+				return;
+			case "model":
+				await this.handleModelCommand(msg, command.rawArgs);
+				return;
+			case "thinking":
+				await this.handleThinkingCommand(msg, command.args[0]);
+				return;
+			case "new":
+				await this.handleNewCommand(msg, command.rawArgs);
+				return;
+			case "sessions":
+				await this.handleSessionsCommand(msg, command.rawArgs);
+				return;
+			case "resume":
+				await this.handleResumeCommand(msg, command.args[0]);
+				return;
+			case "name":
+				await this.handleNameCommand(msg, command.rawArgs);
+				return;
+			case "compact":
+				await this.handleCompactCommand(msg, command.rawArgs);
+				return;
+			case "stop":
+				await this.handleStopCommand(msg);
+				return;
+		}
+	}
+
+	private async getConversation(msg: QQInboundMessage): Promise<QQAgentSession> {
+		if (!this.conversations) throw new Error("QQ 会话运行时尚未就绪");
+		return this.conversations.get(msg);
+	}
+
+	private async handleModelCommand(msg: QQInboundMessage, query: string): Promise<void> {
+		const qq = await this.getConversation(msg);
+		const current = qq.currentModel();
+		const allModels = rankModels(qq.availableModels(), "");
+		const tokens = query.trim().split(/\s+/).filter(Boolean);
+		let page = 1;
+		if (tokens.length >= 2 && /^page$/i.test(tokens.at(-2) ?? "") && /^\d+$/.test(tokens.at(-1) ?? "")) {
+			page = Math.max(1, Number(tokens.at(-1)));
+			tokens.splice(-2, 2);
+		}
+		const queryText = tokens.join(" ").trim();
+		let normalizedQuery = queryText.toLowerCase();
+		if (!normalizedQuery) {
+			const modelPage = buildModelPage(allModels, page, this.config.commands.modelPageSize);
+			const lines = [
+				"## 当前 QQ 模型",
+				"",
+				current ? `**${current.provider}/${current.id}**` : "当前没有可用模型",
+				current ? `- 输入：${current.input.join("、")}` : "",
+				`- 思考等级：${qq.thinkingLevel()}`,
+				"",
+				`## 可用模型（${modelPage.page}/${modelPage.totalPages}，共 ${modelPage.total} 个）`,
+				"",
+				...modelPage.models.map((model, index) => `${modelPage.offset + index + 1}. \`${model.provider}/${model.id}\`${model.input.includes("image") ? " · 图片" : ""}${model.reasoning ? " · 推理" : ""}`),
+				"",
+				formatModelPageFallback(modelPage),
+			].filter(Boolean);
+			await this.replyToQQ(msg, lines.join("\n"), this.modelKeyboard(msg, modelPage));
+			return;
+		}
+		if (/^\d+$/.test(normalizedQuery)) {
+			const index = Number(normalizedQuery) - 1;
+			if (!allModels[index]) throw new Error("模型序号无效或列表已变化；请重新发送 /model");
+			normalizedQuery = `${allModels[index].provider}/${allModels[index].id}`.toLowerCase();
+		}
+		const models = rankModels(qq.availableModels(), normalizedQuery);
+		const exact = models.find((model) => `${model.provider}/${model.id}`.toLowerCase() === normalizedQuery);
+		const matches = exact ? [exact] : models.filter((model) => modelMatches(model, normalizedQuery));
+		if (!matches.length) throw new Error(`没有找到已配置认证且匹配“${query.trim()}”的模型`);
+		if (matches.length > 1) {
+			const matchPage = buildModelPage(matches, page, this.config.commands.modelPageSize);
+			const searchPageCommands = matchPage.fallbackCommands.map((command) =>
+				command.replace("/model page", `/model ${queryText} page`),
+			);
+			await this.replyToQQ(
+				msg,
+				[
+					"## 未切换模型",
+					"",
+					`找到 ${matchPage.total} 个匹配项（${matchPage.page}/${matchPage.totalPages}），请发送完整模型：`,
+					"",
+					...matchPage.models.map((model, index) => `${matchPage.offset + index + 1}. \`${model.provider}/${model.id}\``),
+					"",
+					searchPageCommands.length
+						? `发送 \`${searchPageCommands.join("\` 或 \`")}\` 翻页。`
+						: "请缩小搜索词，或发送完整的 `provider/model` 切换。",
+				].join("\n"),
+				this.searchModelKeyboard(msg, matchPage, queryText),
+			);
+			return;
+		}
+		const selected = await qq.setModel(matches[0].provider, matches[0].id);
+		await this.replyToQQ(
+			msg,
+			`## 已切换 QQ 会话模型\n\n- 模型：\`${selected.provider}/${selected.id}\`\n- 输入：${selected.input.join("、")}\n- 思考等级：${qq.thinkingLevel()}\n\n继续发送问题即可。`,
+			this.helpKeyboard(msg),
+		);
+	}
+
+	private async handleThinkingCommand(msg: QQInboundMessage, requested?: string): Promise<void> {
+		const qq = await this.getConversation(msg);
+		if (!requested) {
+			await this.replyToQQ(
+				msg,
+				`## QQ 会话思考等级\n\n当前：**${qq.thinkingLevel()}**\n\n可选：${qq.availableThinkingLevels().map((level) => `\`${level}\``).join("、")}\n\n示例：\`/thinking high\``,
+				this.thinkingKeyboard(msg, qq.availableThinkingLevels()),
+			);
+			return;
+		}
+		if (!qq.availableThinkingLevels().includes(requested.toLowerCase())) {
+			throw new Error(`当前模型不支持思考等级“${requested}”；可选：${qq.availableThinkingLevels().join("、")}`);
+		}
+		const effective = qq.setThinkingLevel(requested.toLowerCase());
+		await this.replyToQQ(msg, `## 已更新 QQ 会话\n\n思考等级：**${effective}**`);
+	}
+
+	private async handleNewCommand(msg: QQInboundMessage, name: string): Promise<void> {
+		const qq = await this.getConversation(msg);
+		if (qq.isStreaming() || this.hasActiveOrQueuedConversation(msg)) {
+			throw new Error("当前 QQ 任务仍在执行或等待；请先发送 /stop，再发送 /new");
+		}
+		const created = await qq.newSession(name);
+		const model = qq.currentModel();
+		await this.replyToQQ(
+			msg,
+			`## 已新建 QQ 会话\n\n- 会话：${created.name ? `**${created.name}**` : "未命名"}\n- ID：\`${shortId(created.id)}\`\n- 模型：\`${model ? `${model.provider}/${model.id}` : "unknown"}\`\n\n直接发送新任务即可；旧会话仍保存在历史中。`,
+			this.helpKeyboard(msg),
+		);
+	}
+
+	private async handleSessionsCommand(msg: QQInboundMessage, query: string): Promise<void> {
+		const qq = await this.getConversation(msg);
+		const all = await qq.listSessions();
+		const normalized = query.trim().toLowerCase();
+		const sessions = (normalized && !/^\d+$/.test(normalized)
+			? all.filter((session) => sessionMatches(session, normalized))
+			: all
+		).slice(0, this.config.commands.maxListItems);
+		if (!sessions.length) {
+			await this.replyToQQ(msg, "## QQ 会话\n\n没有找到可恢复的历史会话。发送 `/new` 创建一个新会话。");
+			return;
+		}
+		const currentId = qq.sessionId();
+		const lines = [
+			"## QQ 会话",
+			"",
+			...sessions.map((session, index) => formatSessionLine(session, index, currentId)),
+			"",
+			"发送 `/resume 短ID` 恢复。",
+		];
+		await this.replyToQQ(msg, lines.join("\n"), this.sessionsKeyboard(msg, sessions));
+	}
+
+	private async handleResumeCommand(msg: QQInboundMessage, selector?: string): Promise<void> {
+		if (!selector) {
+			await this.handleSessionsCommand(msg, "");
+			return;
+		}
+		const qq = await this.getConversation(msg);
+		if (qq.isStreaming() || this.hasActiveOrQueuedConversation(msg)) {
+			throw new Error("当前 QQ 任务仍在执行或等待；请先发送 /stop，再恢复会话");
+		}
+		const sessions = await qq.listSessions();
+		const normalized = selector.toLowerCase();
+		const matches = /^\d+$/.test(normalized)
+			? sessions.slice(0, this.config.commands.maxListItems).filter((_session, index) => index === Number(normalized) - 1)
+			: sessions.filter((session) => {
+				const compactId = session.id.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+				return compactId.startsWith(normalized) || compactId.endsWith(normalized) || session.name?.toLowerCase() === normalized;
+			});
+		if (!matches.length) throw new Error(`没有找到短 ID 或名称为“${selector}”的 QQ 会话；请重新发送 /sessions`);
+		if (matches.length > 1) throw new Error(`“${selector}”匹配多个 QQ 会话；请使用更完整的短 ID`);
+		if (matches[0].id === qq.sessionId()) {
+			await this.replyToQQ(msg, `当前已经是 QQ 会话 \`${shortId(matches[0].id)}\`，无需切换。`);
+			return;
+		}
+		const resumed = await qq.resumeSession(matches[0].path);
+		const model = qq.currentModel();
+		await this.replyToQQ(
+			msg,
+			`## 已恢复 QQ 会话\n\n- 会话：${resumed.name ? `**${resumed.name}**` : "未命名"}\n- ID：\`${shortId(resumed.id)}\`\n- 模型：\`${model ? `${model.provider}/${model.id}` : "unknown"}\`\n\n后续消息会继续进入该 QQ 会话。`,
+		);
+	}
+
+	private async handleNameCommand(msg: QQInboundMessage, name: string): Promise<void> {
+		if (!name.trim()) throw new Error("会话名称不能为空；示例：/name 修复登录问题");
+		const qq = await this.getConversation(msg);
+		const saved = qq.setSessionName(name);
+		await this.replyToQQ(msg, `已将当前 QQ 会话命名为：**${escapeMarkdownInline(saved)}**`);
+	}
+
+	private async handleCompactCommand(msg: QQInboundMessage, instructions: string): Promise<void> {
+		const qq = await this.getConversation(msg);
+		const result = await qq.compact(instructions);
+		await this.replyToQQ(
+			msg,
+			`## QQ 会话压缩完成\n\n${result.tokensBefore ? `压缩前上下文约 ${result.tokensBefore} tokens。` : "较早内容已汇总，完整历史仍保存在会话文件中。"}`,
+		);
+	}
+
+	private hasActiveOrQueuedConversation(msg: QQInboundMessage): boolean {
+		return (this.running && !!this.activeTarget && sameConversation(msg, this.activeTarget)) ||
+			this.queue.hasWhere((queued) => conversationKey(queued) === conversationKey(msg));
+	}
+
+	private async handleStopCommand(msg: QQInboundMessage): Promise<void> {
+		const qq = this.conversations?.peek(msg);
+		const removed = this.queue.removeWhere((queued) => conversationKey(queued) === conversationKey(msg));
+		const wasRunning = qq?.isStreaming() === true || (this.running && this.activeTarget && sameConversation(msg, this.activeTarget));
+		await qq?.abort();
+		await this.replyToQQ(
+			msg,
+			wasRunning || removed
+				? `## 已停止 QQ 任务\n\n${wasRunning ? "当前生成已中止。" : ""}${removed ? ` 已移除 ${removed} 条待处理消息。` : ""}\n\nQQ 会话历史已保留。`
+				: "当前 QQ 会话没有正在执行或等待的任务。",
+		);
+	}
+
+	private commandHelp(command?: string): string {
+		const detail = command?.toLowerCase();
+		const usages: Record<string, string> = {
+			model: "`/model` 查看当前和可用模型；`/model provider/model` 切换 QQ 会话模型。",
+			thinking: "`/thinking` 查看等级；`/thinking high` 修改 QQ 会话思考等级。",
+			new: "`/new [名称]` 新建 QQ 会话。旧会话会保留；运行中请先 `/stop`。",
+			sessions: "`/sessions [关键词]` 查看或搜索当前 QQ 对话的历史会话。",
+			resume: "`/resume <短ID|唯一名称>` 恢复 QQ 会话。先用 `/sessions` 获取短 ID。",
+			name: "`/name <名称>` 命名当前 QQ 会话。",
+			compact: "`/compact [附加要求]` 压缩当前 QQ 会话上下文。",
+			stop: "`/stop` 中止当前 QQ 任务并移除该对话尚未处理的消息。",
+		};
+		if (detail && usages[detail]) return `## /${detail}\n\n${usages[detail]}`;
+		return [
+			"## QQ Agent 命令",
+			"",
+			"- `/status` 当前模型、QQ 会话和运行状态",
+			"- `/model [查询]` 查看或切换模型",
+			"- `/thinking [等级]` 查看或修改思考等级",
+			"- `/new [名称]` 新建 QQ 会话",
+			"- `/sessions [关键词]` 查看历史 QQ 会话",
+			"- `/resume <短ID>` 恢复 QQ 会话",
+			"- `/name <名称>` 命名当前 QQ 会话",
+			"- `/compact [要求]` 压缩上下文",
+			"- `/stop` 停止当前任务",
+			"",
+			"这些命令只管理隔离的 **QQ 会话**，不会切换电脑终端里的本地 Pi 会话。",
+		].join("\n");
+	}
+
+	private async qqStatusText(msg: QQInboundMessage): Promise<string> {
+		const qq = await this.getConversation(msg);
+		const model = qq.currentModel();
+		return [
+			"## QQ Agent 状态",
+			"",
+			`- 连接：${this.state === "connected" ? "已连接" : this.state}`,
+			`- 会话：${qq.sessionName() ? `**${escapeMarkdownInline(qq.sessionName() ?? "")}**` : "未命名"} (\`${shortId(qq.sessionId())}\`)`,
+			`- 模型：\`${model ? `${model.provider}/${model.id}` : "unknown"}\``,
+			`- 思考：\`${qq.thinkingLevel()}\``,
+			`- 当前任务：${qq.isStreaming() ? "执行中" : "空闲"}`,
+			`- 等待消息：${this.queue.size}`,
+			`- 历史模式：${this.config.sessions.mode === "persistent" ? "持久化" : "内存"}`,
+			`- 宿主：${this.config.startup.keepAcrossLocalSessions ? "本地会话切换保持" : "会话级"}`,
+		].join("\n");
+	}
+
+	private helpKeyboard(msg: QQInboundMessage): QQKeyboard | undefined {
+		return this.commandKeyboard(msg, [
+			[{ label: "当前状态", command: "/status", primary: true }, { label: "切换模型", command: "/model" }],
+			[{ label: "新建会话", command: "/new" }, { label: "历史会话", command: "/sessions" }],
+			[{ label: "停止任务", command: "/stop" }, { label: "帮助", command: "/help" }],
+		]);
+	}
+
+	private modelKeyboard(msg: QQInboundMessage, page: ModelPage): QQKeyboard | undefined {
+		return this.commandKeyboard(msg, page.keyboardRows);
+	}
+
+	private searchModelKeyboard(msg: QQInboundMessage, page: ModelPage, query: string): QQKeyboard | undefined {
+		const rows = page.keyboardRows.map((row) => row.map((button) => ({ ...button })));
+		const navigation = rows.at(-2);
+		if (page.totalPages > 1 && navigation) {
+			for (const button of navigation) {
+				button.command = button.command.replace("/model page", `/model ${query} page`);
+			}
+		}
+		return this.commandKeyboard(msg, rows);
+	}
+
+	private thinkingKeyboard(msg: QQInboundMessage, levels: string[]): QQKeyboard | undefined {
+		const rows: QQCommandButton[][] = [];
+		for (let index = 0; index < levels.length; index += 2) {
+			rows.push(levels.slice(index, index + 2).map((level) => ({ label: level, command: `/thinking ${level}` })));
+		}
+		return this.commandKeyboard(msg, rows);
+	}
+
+	private sessionsKeyboard(msg: QQInboundMessage, sessions: QQSessionInfo[]): QQKeyboard | undefined {
+		const rows: QQCommandButton[][] = [];
+		for (let index = 0; index < sessions.length; index += 2) {
+			rows.push(sessions.slice(index, index + 2).map((session) => ({
+				label: session.name?.slice(0, 14) || shortId(session.id),
+				command: `/resume ${shortId(session.id)}`,
+			})));
+		}
+		rows.push([{ label: "新建会话", command: "/new", primary: true }, { label: "返回帮助", command: "/help" }]);
+		return this.commandKeyboard(msg, rows);
+	}
+
+	private commandKeyboard(msg: QQInboundMessage, rows: QQCommandButton[][]): QQKeyboard | undefined {
+		return this.config.commands.buttons ? buildCommandKeyboard(msg, rows) : undefined;
+	}
+
+	private async replyToQQ(msg: QQInboundMessage, text: string, keyboard?: QQKeyboard): Promise<void> {
 		const target: QQReplyTarget = {
 			type: msg.type,
 			userOpenId: msg.userOpenId,
@@ -436,16 +816,7 @@ export class PiQQBotRuntime {
 			msgId: msg.id,
 			createdAt: Date.now(),
 		};
-		await this.deliverReply(target, text, msg.fake === true);
-	}
-
-	private helpText(): string {
-		const base =
-			"QQ \u53ef\u7528\u547d\u4ee4\uff1a\n/qqbot-status \u72b6\u6001\n/qqbot-last \u6700\u8fd1\u6d88\u606f\n/qqbot-help \u5e2e\u52a9";
-		const tail = this.config.allowCommands
-			? "\n\u5176\u4ed6 / \u5f00\u5934\u7684\u8f93\u5165\u4f1a\u5728\u72ec\u7acb\u7684 QQ \u4f1a\u8bdd\u91cc\u5904\u7406\u3002\u76f4\u63a5\u53d1\u6587\u672c = \u5411 Pi \u63d0\u95ee\uff08\u72ec\u7acb\u4f1a\u8bdd\uff0c\u4e0d\u5f71\u54cd\u672c\u5730\uff09\u3002"
-			: "\n\u76f4\u63a5\u53d1\u6587\u672c = \u5411 Pi \u63d0\u95ee\uff08\u72ec\u7acb\u4f1a\u8bdd\uff0c\u4e0d\u5f71\u54cd\u672c\u5730\uff09\u3002";
-		return base + tail;
+		await this.deliverReply(target, text, msg.fake === true, keyboard);
 	}
 
 	/** Simulate an inbound private message for local testing (/qqbot-fake). */
@@ -477,7 +848,7 @@ export class PiQQBotRuntime {
 
 	private pump(): void {
 		if (this.running) return; // a QQ run is in flight
-		if (!this.qq?.isReady()) return; // isolated session not ready yet
+		if (!this.conversations) return;
 		const msg = this.queue.dequeue();
 		if (!msg) return;
 		this.emitRuntimeState();
@@ -486,7 +857,12 @@ export class PiQQBotRuntime {
 
 	// --- Outbound ------------------------------------------------------------
 
-	private async deliverReply(target: QQReplyTarget, text: string, fake: boolean): Promise<void> {
+	private async deliverReply(
+		target: QQReplyTarget,
+		text: string,
+		fake: boolean,
+		keyboard?: QQKeyboard,
+	): Promise<void> {
 		const full = (this.config.replyPrefix ?? "") + text;
 		const formatted = formatQQReply(full, this.config.replyFormat);
 		const chunks = this.config.replyFormat === "plain" ? formatted.plain : formatted.markdown;
@@ -534,6 +910,7 @@ export class PiQQBotRuntime {
 		let sentChunks = 0;
 		let nextMsgSeq = 1;
 		let useMarkdown = this.config.replyFormat !== "plain";
+		let delivery = useMarkdown ? "markdown" : "plain";
 		for (let i = 0; i < chunks.length && i < QQ_MAX_REPLY_CHUNKS; i++) {
 			try {
 				if (!useMarkdown) {
@@ -544,9 +921,13 @@ export class PiQQBotRuntime {
 						formatted.markdown[i],
 						formatted.plain[i],
 						nextMsgSeq,
+						i === chunks.length - 1 ? keyboard : undefined,
 					);
 					nextMsgSeq += fellBack ? 2 : 1;
-					if (fellBack) useMarkdown = false;
+					if (fellBack) {
+						useMarkdown = false;
+						delivery = "plain-fallback";
+					}
 				}
 				sentChunks++;
 			} catch (err) {
@@ -565,6 +946,7 @@ export class PiQQBotRuntime {
 				return;
 			}
 		}
+		this.debugLog(`reply delivery=${delivery} chunks=${sentChunks}${keyboard ? ` keyboardRows=${keyboard.content.rows.length}` : ""}`);
 		this.emit({
 			kind: "reply_end",
 			messageId: target.msgId,
@@ -579,16 +961,18 @@ export class PiQQBotRuntime {
 		markdown: string,
 		plain: string,
 		msgSeq: number,
+		keyboard?: QQKeyboard,
 	): Promise<boolean> {
 		if (!this.api) throw new Error("QQ API is not ready");
 		try {
-			await this.api.sendMarkdown(target, markdown, msgSeq);
+			await this.api.sendMarkdown(target, markdown, msgSeq, keyboard);
 			return false;
 		} catch (err) {
 			if (!(err instanceof QQApiError) || !canFallbackFromMarkdown(err)) throw err;
 			this.debugLog(`markdown rejected; falling back to plain text (status ${err.status}${err.code != null ? `, code ${err.code}` : ""})`);
 			// A rejected HTTP response did not deliver a QQ message. Use the next
-			// sequence number and keep subsequent chunks plain for this reply.
+			// sequence number and keep subsequent chunks plain for this reply. The
+			// page navigation command remains in the body as a text fallback.
 			await this.api.sendText(target, plain, msgSeq + 1);
 			return true;
 		}
@@ -617,8 +1001,8 @@ export class PiQQBotRuntime {
 			`pi-qqbot: ${this.config.enabled ? "enabled" : "disabled"} (appId ${maskAppId(this.config.appId)}, ${this.config.sandbox ? "sandbox" : "prod"})`,
 			`connection: ${this.state}${this.stateDetail ? ` (${this.stateDetail})` : ""}`,
 			`queue: ${this.queue.size}`,
-			`session: isolated (${this.qq?.isReady() ? "ready" : "not ready"})`,
-			`commands: ${this.config.allowCommands ? "on (isolated)" : "info-only"}`,
+			`session: isolated (${this.conversations ? "ready" : "not ready"}, resident ${this.conversations?.residentCount ?? 0})`,
+			`commands: ${this.config.commands.enabled ? "on (SDK control)" : "off"}`,
 			`process: ${this.config.showProcess ? "on" : "off"}`,
 			`reply format: ${this.config.replyFormat}`,
 			`media: ${this.config.media.enabled ? "on" : "off"}`,
@@ -704,6 +1088,59 @@ export function isAllowed(config: PiQQBotConfig, msg: QQInboundMessage): boolean
 	return false;
 }
 
+function sameConversation(msg: QQInboundMessage, target: QQReplyTarget): boolean {
+	return msg.type === target.type &&
+		(msg.type === "private" ? msg.userOpenId === target.userOpenId : msg.groupOpenId === target.groupOpenId);
+}
+
+function modelMatches(model: QQModelInfo, query: string): boolean {
+	const haystack = `${model.provider}/${model.id} ${model.name}`.toLowerCase();
+	return haystack.includes(query);
+}
+
+function rankModels(models: QQModelInfo[], query: string): QQModelInfo[] {
+	return [...models].sort((left, right) => {
+		if (query) {
+			const leftId = `${left.provider}/${left.id}`.toLowerCase();
+			const rightId = `${right.provider}/${right.id}`.toLowerCase();
+			const leftScore = leftId === query ? 0 : leftId.startsWith(query) ? 1 : leftId.includes(query) ? 2 : 3;
+			const rightScore = rightId === query ? 0 : rightId.startsWith(query) ? 1 : rightId.includes(query) ? 2 : 3;
+			if (leftScore !== rightScore) return leftScore - rightScore;
+		}
+		return `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`);
+	});
+}
+
+function sessionMatches(session: QQSessionInfo, query: string): boolean {
+	return `${session.name ?? ""} ${session.firstMessage} ${session.allMessagesText}`.toLowerCase().includes(query);
+}
+
+function formatSessionLine(session: QQSessionInfo, index: number, currentId: string): string {
+	const title = escapeMarkdownInline(session.name ?? (truncate(session.firstMessage) || "未命名会话"));
+	const current = session.id === currentId ? " · 当前" : "";
+	return `${index + 1}. **${title}**${current}\n   \`${shortId(session.id)}\` · ${formatSessionTime(session.modified)} · ${session.messageCount} 条消息`;
+}
+
+function formatSessionTime(value: Date): string {
+	const date = value instanceof Date ? value : new Date(value);
+	return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function shortId(value: string): string {
+	const compact = value.replace(/[^a-zA-Z0-9]/g, "");
+	// UUIDv7 starts with a timestamp, so its first eight characters commonly
+	// collide for sessions created close together. The random suffix is safer.
+	return compact.slice(-8) || "unknown";
+}
+
+function escapeMarkdownInline(value: string): string {
+	return value.replace(/[\\`*_[\]~]/g, "\\$&");
+}
+
+function sanitizeCommandError(value: string): string {
+	return value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
 function hasUsableAgentInput(msg: QQInboundMessage, resources: PreparedAttachment[]): boolean {
 	if (msg.text.trim()) return true;
 	return resources.some((resource) => resource.status === "ready");
@@ -718,6 +1155,11 @@ function formatAttachmentFailures(resources: PreparedAttachment[]): string {
 			return `${resource.filename}：${note}（${resource.errorCode ?? "attachment_failed"}）`;
 		})
 		.join("\n");
+}
+
+function maskOpenId(value: string): string {
+	if (value.length <= 12) return `${value.slice(0, 3)}…${value.slice(-3)}`;
+	return `${value.slice(0, 6)}…${value.slice(-6)}`;
 }
 
 function sanitizeSummaryFilename(value: string): string {
