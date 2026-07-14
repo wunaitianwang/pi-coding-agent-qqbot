@@ -52,3 +52,72 @@ export type ConnectionState =
 	| "connecting"
 	| "connected"
 	| "error";
+
+/**
+ * Process-local events mirrored into the Pi terminal that explicitly ran
+ * /qqbot-start. These events are UI-only: they are never appended to the local
+ * Pi session or sent to its model.
+ */
+export type QQTerminalEvent =
+	| {
+			kind: "runtime_state";
+			connection: ConnectionState;
+			detail?: string;
+			queueSize: number;
+			running: boolean;
+			activeLabel?: string;
+			at: number;
+	  }
+	| {
+			kind: "inbound";
+			messageId: string;
+			channel: "private" | "group";
+			senderLabel: string;
+			text: string;
+			fake: boolean;
+			at: number;
+	  }
+	| { kind: "queued"; messageId: string; queueSize: number; at: number }
+	| { kind: "run_start"; messageId: string; at: number }
+	| { kind: "assistant_start"; messageId: string; at: number }
+	| { kind: "assistant_delta"; messageId: string; delta: string; at: number }
+	| { kind: "assistant_end"; messageId: string; at: number }
+	| {
+			kind: "tool_start";
+			messageId: string;
+			toolCallId: string;
+			toolName: string;
+			args: unknown;
+			at: number;
+	  }
+	| {
+			kind: "tool_end";
+			messageId: string;
+			toolCallId: string;
+			toolName: string;
+			isError: boolean;
+			at: number;
+	  }
+	| {
+			kind: "reply_start";
+			messageId: string;
+			chunks: number;
+			fake: boolean;
+			at: number;
+	  }
+	| {
+			kind: "reply_end";
+			messageId: string;
+			ok: boolean;
+			sentChunks: number;
+			error?: string;
+			at: number;
+	  }
+	| { kind: "run_end"; messageId: string; at: number }
+	| { kind: "error"; messageId?: string; stage: string; message: string; at: number };
+
+/** Optional observer owned by one Pi TUI process. */
+export interface QQConversationObserver {
+	onEvent(event: QQTerminalEvent): void;
+	dispose(): void;
+}

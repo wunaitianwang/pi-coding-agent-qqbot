@@ -21,6 +21,7 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export interface QQToolCall {
+	toolCallId: string;
 	name: string;
 	args: unknown;
 	isError: boolean;
@@ -30,6 +31,15 @@ export interface QQRunResult {
 	text: string;
 	tools: QQToolCall[];
 }
+
+export type QQAgentRunEvent =
+	| { kind: "assistant_start" }
+	| { kind: "assistant_delta"; delta: string }
+	| { kind: "assistant_end" }
+	| { kind: "tool_start"; toolCallId: string; toolName: string; args: unknown }
+	| { kind: "tool_end"; toolCallId: string; toolName: string; isError: boolean };
+
+export type QQAgentRunObserver = (event: QQAgentRunEvent) => void;
 
 // Split so the literal never appears verbatim in the bundle path scan target.
 const SDK_MARKER = "@earendil-works" + "/" + "pi-coding-agent";
@@ -68,6 +78,7 @@ export class QQAgentSession {
 
 	/** Create the isolated session. Throws if the SDK/model cannot be loaded. */
 	async init(cwd: string): Promise<void> {
+		this.disposed = false;
 		const sdk = await loadSdk();
 		const loader = new sdk.DefaultResourceLoader({
 			cwd,
@@ -80,6 +91,10 @@ export class QQAgentSession {
 			resourceLoader: loader,
 			sessionManager: sdk.SessionManager.inMemory(cwd),
 		});
+		if (this.disposed) {
+			session.dispose();
+			return;
+		}
 		this.session = session;
 	}
 
@@ -93,16 +108,39 @@ export class QQAgentSession {
 	 *
 	 * Callers must serialize runs (one at a time); the router's queue does this.
 	 */
-	async run(prompt: string): Promise<QQRunResult> {
+	async run(prompt: string, observer?: QQAgentRunObserver): Promise<QQRunResult> {
 		if (!this.session) throw new Error("QQ session not initialized");
 		const tools: QQToolCall[] = [];
+		const toolIndexes = new Map<string, number>();
 		let messages: unknown[] = [];
+		const emit = (event: QQAgentRunEvent): void => {
+			try {
+				observer?.(event);
+			} catch {
+				// Terminal observation must never interfere with the isolated agent run.
+			}
+		};
 		// biome-ignore lint/suspicious/noExplicitAny: event union comes from the dynamic SDK.
 		const unsubscribe: () => void = this.session.subscribe((e: any) => {
-			if (e?.type === "tool_execution_start") {
-				tools.push({ name: e.toolName, args: e.args, isError: false });
+			if (e?.type === "message_update" && e.assistantMessageEvent?.type === "text_start") {
+				emit({ kind: "assistant_start" });
+			} else if (e?.type === "message_update" && e.assistantMessageEvent?.type === "text_delta") {
+				const delta = e.assistantMessageEvent.delta;
+				if (typeof delta === "string" && delta) emit({ kind: "assistant_delta", delta });
+			} else if (e?.type === "message_update" && e.assistantMessageEvent?.type === "text_end") {
+				emit({ kind: "assistant_end" });
+			} else if (e?.type === "tool_execution_start") {
+				const toolCallId = typeof e.toolCallId === "string" ? e.toolCallId : `tool-${tools.length}`;
+				const toolName = typeof e.toolName === "string" ? e.toolName : "tool";
+				toolIndexes.set(toolCallId, tools.length);
+				tools.push({ toolCallId, name: toolName, args: e.args, isError: false });
+				emit({ kind: "tool_start", toolCallId, toolName, args: e.args });
 			} else if (e?.type === "tool_execution_end") {
-				if (tools.length) tools[tools.length - 1].isError = !!e.isError;
+				const toolCallId = typeof e.toolCallId === "string" ? e.toolCallId : "";
+				const toolName = typeof e.toolName === "string" ? e.toolName : "tool";
+				const index = toolIndexes.get(toolCallId);
+				if (index !== undefined) tools[index].isError = !!e.isError;
+				emit({ kind: "tool_end", toolCallId, toolName, isError: !!e.isError });
 			} else if (e?.type === "agent_end") {
 				if (Array.isArray(e.messages)) messages = e.messages;
 			}

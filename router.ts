@@ -3,27 +3,31 @@
  *
  * Responsibilities:
  *  - validate the allowlist for inbound messages
- *  - convert QQ inbound events into Pi user messages (pi.sendUserMessage)
- *  - remember the reply target (msg_id) before injecting
- *  - capture the final assistant response on agent_end and send it back to QQ
- *    as a passive reply (msg_id + msg_seq)
- *  - serialize QQ conversations through a single FIFO queue so replies are not
- *    misrouted while Pi processes one turn at a time
+ *  - serialize QQ conversations through a single FIFO queue
+ *  - run each message in the isolated QQ AgentSession
+ *  - send the final assistant response back as a passive QQ reply
+ *  - optionally mirror process-local events to the Pi TUI that ran /qqbot-start
  *
- * Delivery model: a queued QQ message is only injected while Pi is idle (no
- * active turn). This keeps each injected message on its own turn, so the
- * following agent_end unambiguously belongs to that QQ conversation.
+ * The observer is UI-only and optional. QQ handling never falls back to the
+ * local Pi session, and observer failures never affect QQ replies.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { maskAppId, type PiQQBotConfig } from "./config";
+import { maskAppId } from "./config";
 import { QQApi, QQApiError } from "./qq-api";
 import { QQAuth } from "./qq-auth";
 import { QQGateway } from "./qq-gateway";
-import { QQAgentSession, type QQToolCall } from "./qq-session";
+import { QQAgentSession, type QQAgentRunEvent, type QQToolCall } from "./qq-session";
 import { MessageQueue } from "./queue";
-import type { ConnectionState, QQInboundMessage, QQReplyTarget } from "./types";
+import type {
+	ConnectionState,
+	PiQQBotConfig,
+	QQConversationObserver,
+	QQInboundMessage,
+	QQReplyTarget,
+	QQTerminalEvent,
+} from "./types";
 
 const CHUNK_SIZE = 800;
 const MAX_CHUNKS = 5; // hard cap of 5 passive replies per msg_id
@@ -70,7 +74,6 @@ interface OutboundSummary {
 }
 
 export class PiQQBotRuntime {
-	private readonly pi: ExtensionAPI;
 	private readonly config: PiQQBotConfig;
 
 	private auth?: QQAuth;
@@ -91,26 +94,49 @@ export class PiQQBotRuntime {
 	private lastOutbound?: OutboundSummary;
 
 	private pumpScheduled = false;
+	private pumpTimer?: ReturnType<typeof setTimeout>;
 	private fakeCounter = 0;
+	private observer?: QQConversationObserver;
 
-	constructor(pi: ExtensionAPI, config: PiQQBotConfig) {
-		this.pi = pi;
+	constructor(config: PiQQBotConfig) {
 		this.config = config;
 		this.queue = new MessageQueue(config.maxQueueSize ?? 20);
 	}
 
-	async start(ctx: ExtensionContext): Promise<void> {
+	attachObserver(observer: QQConversationObserver): void {
+		this.observer = observer;
+		this.emitRuntimeState();
+	}
+
+	detachObserver(observer?: QQConversationObserver): void {
+		if (!observer || this.observer === observer) this.observer = undefined;
+	}
+
+	isReady(): boolean {
+		return this.qq?.isReady() === true;
+	}
+
+	async start(ctx: ExtensionContext): Promise<boolean> {
 		this.ctx = ctx;
 
 		// Isolated QQ session first, so QQ traffic never touches the local session.
-		this.qq = new QQAgentSession();
+		const qq = new QQAgentSession();
+		this.qq = qq;
 		try {
-			await this.qq.init(process.cwd());
+			await qq.init(ctx.cwd);
 		} catch (err) {
-			this.qq = undefined;
+			if (this.qq === qq) this.qq = undefined;
+			this.state = "error";
+			this.stateDetail = "isolated session initialization failed";
 			this.lastError = `qq session init failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.emit({ kind: "error", stage: "session init", message: this.lastError, at: Date.now() });
+			this.emitRuntimeState();
 			this.notify(`pi-qqbot: ${this.lastError}`, "error");
-			return; // without an isolated session we must not fall back to the local session
+			return false; // without an isolated session we must not fall back to the local session
+		}
+		if (this.qq !== qq || !qq.isReady()) {
+			if (this.qq === qq) this.qq = undefined;
+			return false; // stopped while asynchronous initialization was in flight
 		}
 
 		this.auth = new QQAuth(this.config.appId, this.config.clientSecret);
@@ -124,6 +150,7 @@ export class PiQQBotRuntime {
 					this.state = state;
 					this.stateDetail = detail;
 					if (state === "error" && detail) this.lastError = detail;
+					this.emitRuntimeState();
 					if (state === "connected") this.notify("pi-qqbot connected", "info");
 					if (state === "error") this.notify(`pi-qqbot error: ${detail ?? ""}`, "error");
 				},
@@ -131,9 +158,13 @@ export class PiQQBotRuntime {
 			},
 		);
 		await this.gateway.connect();
+		return true;
 	}
 
 	async stop(): Promise<void> {
+		if (this.pumpTimer) clearTimeout(this.pumpTimer);
+		this.pumpTimer = undefined;
+		this.pumpScheduled = false;
 		this.gateway?.close();
 		this.gateway = undefined;
 		this.qq?.dispose();
@@ -143,6 +174,8 @@ export class PiQQBotRuntime {
 		this.activeFake = false;
 		this.running = false;
 		this.state = "disconnected";
+		this.stateDetail = undefined;
+		this.emitRuntimeState();
 	}
 
 	async reconnect(): Promise<void> {
@@ -156,6 +189,7 @@ export class PiQQBotRuntime {
 	private async runOne(msg: QQInboundMessage): Promise<void> {
 		if (!this.qq?.isReady()) {
 			this.lastError = "qq session not ready";
+			this.emit({ kind: "error", messageId: msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
 			return;
 		}
 		this.running = true;
@@ -168,8 +202,12 @@ export class PiQQBotRuntime {
 		};
 		this.activeTarget = target;
 		this.activeFake = msg.fake === true;
+		this.emit({ kind: "run_start", messageId: msg.id, at: Date.now() });
+		this.emitRuntimeState();
 		try {
-			const { text, tools } = await this.qq.run(buildPrompt(msg));
+			const { text, tools } = await this.qq.run(buildPrompt(msg), (event) =>
+				this.forwardAgentEvent(msg.id, event),
+			);
 			const body = this.config.showProcess
 				? formatWithProcess(buildTranscript(tools), text)
 				: text;
@@ -180,12 +218,44 @@ export class PiQQBotRuntime {
 			}
 		} catch (err) {
 			this.lastError = `qq session run failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.emit({ kind: "error", messageId: msg.id, stage: "agent run", message: this.lastError, at: Date.now() });
 			this.debugLog(this.lastError);
 		} finally {
 			this.running = false;
 			this.activeTarget = undefined;
 			this.activeFake = false;
+			this.emit({ kind: "run_end", messageId: msg.id, at: Date.now() });
+			this.emitRuntimeState();
 			this.schedulePump();
+		}
+	}
+
+	private forwardAgentEvent(messageId: string, event: QQAgentRunEvent): void {
+		const at = Date.now();
+		if (event.kind === "assistant_start") {
+			this.emit({ kind: "assistant_start", messageId, at });
+		} else if (event.kind === "assistant_delta") {
+			this.emit({ kind: "assistant_delta", messageId, delta: event.delta, at });
+		} else if (event.kind === "assistant_end") {
+			this.emit({ kind: "assistant_end", messageId, at });
+		} else if (event.kind === "tool_start") {
+			this.emit({
+				kind: "tool_start",
+				messageId,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				args: event.args,
+				at,
+			});
+		} else {
+			this.emit({
+				kind: "tool_end",
+				messageId,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				isError: event.isError,
+				at,
+			});
 		}
 	}
 
@@ -217,6 +287,15 @@ export class PiQQBotRuntime {
 		}
 
 		const text = msg.text.trim();
+		this.emit({
+			kind: "inbound",
+			messageId: msg.id,
+			channel: msg.type,
+			senderLabel: msg.type === "group" ? msg.groupOpenId ?? msg.userOpenId : msg.userOpenId,
+			text,
+			fake: msg.fake === true,
+			at: msg.receivedAt,
+		});
 		if (text.startsWith("/")) {
 			this.handleCommand(msg, text);
 			return;
@@ -228,12 +307,16 @@ export class PiQQBotRuntime {
 		const accepted = this.queue.enqueue(msg);
 		if (!accepted) {
 			this.lastError = "queue full; message dropped";
+			this.emit({ kind: "error", messageId: msg.id, stage: "queue", message: this.lastError, at: Date.now() });
+			this.emitRuntimeState();
 			this.debugLog(this.lastError);
 			if (this.config.sendBusyNotice && !msg.fake) {
 				void this.sendBusyNotice(msg);
 			}
 			return;
 		}
+		this.emit({ kind: "queued", messageId: msg.id, queueSize: this.queue.size, at: Date.now() });
+		this.emitRuntimeState();
 		this.schedulePump();
 	}
 
@@ -312,7 +395,8 @@ export class PiQQBotRuntime {
 	private schedulePump(): void {
 		if (this.pumpScheduled) return;
 		this.pumpScheduled = true;
-		setTimeout(() => {
+		this.pumpTimer = setTimeout(() => {
+			this.pumpTimer = undefined;
 			this.pumpScheduled = false;
 			this.pump();
 		}, 0);
@@ -323,6 +407,7 @@ export class PiQQBotRuntime {
 		if (!this.qq?.isReady()) return; // isolated session not ready yet
 		const msg = this.queue.dequeue();
 		if (!msg) return;
+		this.emitRuntimeState();
 		void this.runOne(msg);
 	}
 
@@ -340,24 +425,66 @@ export class PiQQBotRuntime {
 			at: Date.now(),
 			fake,
 		};
+		this.emit({
+			kind: "reply_start",
+			messageId: target.msgId,
+			chunks: chunks.length,
+			fake,
+			at: Date.now(),
+		});
 
 		if (fake) {
+			this.emit({
+				kind: "reply_end",
+				messageId: target.msgId,
+				ok: true,
+				sentChunks: chunks.length,
+				at: Date.now(),
+			});
 			this.debugLog(`[fake] would send ${chunks.length} chunk(s) to ${target.type}`);
 			return;
 		}
-		if (!this.api) return;
+		if (!this.api) {
+			const detail = "QQ API is not ready";
+			this.emit({
+				kind: "reply_end",
+				messageId: target.msgId,
+				ok: false,
+				sentChunks: 0,
+				error: detail,
+				at: Date.now(),
+			});
+			return;
+		}
 
+		let sentChunks = 0;
 		for (let i = 0; i < chunks.length; i++) {
 			try {
 				await this.api.sendText(target, chunks[i], i + 1);
+				sentChunks++;
 			} catch (err) {
 				const detail = err instanceof QQApiError ? err.message : String(err);
 				this.lastError = `send failed: ${detail}`;
+				this.emit({
+					kind: "reply_end",
+					messageId: target.msgId,
+					ok: false,
+					sentChunks,
+					error: detail,
+					at: Date.now(),
+				});
 				this.debugLog(this.lastError);
 				this.notify(`pi-qqbot send failed: ${detail}`, "error");
-				break; // stop; passive-reply window/cap likely exceeded
+				return; // passive-reply window/cap likely exceeded
 			}
 		}
+		this.emit({
+			kind: "reply_end",
+			messageId: target.msgId,
+			ok: true,
+			sentChunks,
+			at: Date.now(),
+		});
 	}
 
 	private async sendBusyNotice(msg: QQInboundMessage): Promise<void> {
@@ -419,6 +546,30 @@ export class PiQQBotRuntime {
 
 	private notify(text: string, level: "info" | "warning" | "error"): void {
 		if (this.ctx?.hasUI) this.ctx.ui.notify(text, level);
+	}
+
+	private emit(event: QQTerminalEvent): void {
+		try {
+			this.observer?.onEvent(event);
+		} catch {
+			// A terminal view must never break QQ message handling.
+		}
+	}
+
+	private emitRuntimeState(): void {
+		this.emit({
+			kind: "runtime_state",
+			connection: this.state,
+			detail: this.stateDetail,
+			queueSize: this.queue.size,
+			running: this.running,
+			activeLabel: this.activeTarget
+				? this.activeTarget.type === "group"
+					? this.activeTarget.groupOpenId
+					: this.activeTarget.userOpenId
+				: undefined,
+			at: Date.now(),
+		});
 	}
 
 	private debugLog(msg: string): void {
